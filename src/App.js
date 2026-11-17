@@ -18,9 +18,11 @@ import { HexMap } from './hexmap/HexMap.js'
 import { Lighting } from './Lighting.js'
 import { PostFX } from './PostFX.js'
 import { WavesMask } from './hexmap/effects/WavesMask.js'
-import { setSeed } from './SeededRandom.js'
+import { setSeed, getSeed } from './SeededRandom.js'
+import { MapLibrary } from './maps/MapLibrary.js'
 import { LEVELS_COUNT } from './hexmap/HexTileData.js'
 import gsap from 'gsap'
+import { RUNTIME_MINIMAL } from './runtimeConfig.js'
 
 // Global status update function
 export function setStatus(text) {
@@ -98,11 +100,15 @@ export class App {
     this.params = JSON.parse(JSON.stringify(GUIManager.defaultParams))
 
     this.initCamera()
-    this.initPostProcessing()
-    this.initStats()
-    this.initCSSRenderer()
+    if (!RUNTIME_MINIMAL) {
+      this.initPostProcessing()
+      this.initStats()
+      this.initCSSRenderer()
+    }
     this.initStatusOverlay()
-    this.initModeButtons()
+    if (!RUNTIME_MINIMAL) {
+      this.initModeButtons()
+    }
 
     this.seedElement.textContent = `seed: ${seed}`
 
@@ -117,104 +123,80 @@ export class App {
     this.lighting = new Lighting(this.scene, this.renderer, this.params)
     this.city = new HexMap(this.scene, this.params)
     // Pass coast mask RT texture so water shader can sample it directly
-    this.city.coastMaskTexture = this.wavesMask.texture
-    this.city.coveMaskTexture = this.wavesMask.coveTexture
+    if (!RUNTIME_MINIMAL) {
+      this.city.coastMaskTexture = this.wavesMask.texture
+      this.city.coveMaskTexture = this.wavesMask.coveTexture
+    }
 
     await this.lighting.init()
     await this.city.init()
 
-    // Water mask: swap tile materials to unlit B&W mask material for mask RT render
-    this._savedMats = new Map()
-    this.postFX.onWaterMaskRender = (enabled) => {
-      if (enabled) {
-        const maskMat = this.city.waterMaskMaterial
-        for (const grid of this.city.grids.values()) {
-          if (grid.hexMesh) {
-            this._savedMats.set(grid.hexMesh, grid.hexMesh.material)
-            grid.hexMesh.material = maskMat
+    this.mapLibrary = new MapLibrary(this)
+    const savedMap = await this.mapLibrary.init()
+    let restored = false
+    if (savedMap) {
+      try {
+        await this.mapLibrary.open(savedMap)
+        restored = true
+      } catch (error) {
+        this.mapLibrary.message(`Could not open saved map: ${error.message}. Import another map or click Generate.`)
+      }
+    }
+
+    // Without a saved map, the workshop lets the user choose a recipe before generating.
+    if (RUNTIME_MINIMAL) {
+      // Minimal mode skips coast-mask postfx; hiding this plane avoids visual artifacts.
+      if (this.city.water?.mesh) this.city.water.mesh.visible = false
+    }
+
+    this.publishMap()
+
+    if (!RUNTIME_MINIMAL) {
+      // Water mask: swap tile materials to unlit B&W mask material for mask RT render
+      this._savedMats = new Map()
+      this.postFX.onWaterMaskRender = (enabled) => {
+        if (enabled) {
+          const maskMat = this.city.waterMaskMaterial
+          for (const grid of this.city.grids.values()) {
+            if (grid.hexMesh) {
+              this._savedMats.set(grid.hexMesh, grid.hexMesh.material)
+              grid.hexMesh.material = maskMat
+            }
+            if (grid.decorations?.mesh) {
+              this._savedMats.set(grid.decorations.mesh, grid.decorations.mesh.material)
+              grid.decorations.mesh.material = maskMat
+            }
           }
-          if (grid.decorations?.mesh) {
-            this._savedMats.set(grid.decorations.mesh, grid.decorations.mesh.material)
-            grid.decorations.mesh.material = maskMat
-          }
+        } else {
+          for (const [mesh, mat] of this._savedMats) mesh.material = mat
+          this._savedMats.clear()
         }
-      } else {
-        for (const [mesh, mat] of this._savedMats) mesh.material = mat
-        this._savedMats.clear()
-      }
-    }
-
-    // Shared tween target for wave uniforms — gsap.to overwrites previous tweens automatically
-    this._waveFade = { opacity: 0, gradOpacity: 0, mask: 0 }
-
-    // Fade out waves immediately when a new grid starts building
-    this.city.onBeforeTilesChanged = () => {
-      if (this.city._autoBuilding) return
-      const opacity = this.city._waveOpacity
-      if (!opacity || opacity.value === 0) return
-
-      // Cancel any pending mask render from a previous build
-      if (this._pendingMaskRender) {
-        this._pendingMaskRender.cancelled = true
-        this._pendingMaskRender = null
       }
 
-      // Kill any running wave tweens and sync target with current uniforms
-      gsap.killTweensOf(this._waveFade)
-      this._waveFade.opacity = opacity.value
-      this._waveFade.gradOpacity = this.city._waveGradientOpacity?.value ?? 0
-      this._waveFade.mask = this.city._waveMaskStrength?.value ?? 1
+      // Shared tween target for wave uniforms — gsap.to overwrites previous tweens automatically
+      this._waveFade = { opacity: 0, gradOpacity: 0, mask: 0 }
 
-      gsap.to(this._waveFade, {
-        opacity: 0, gradOpacity: 0, mask: 0,
-        duration: 0.5,
-        onUpdate: () => {
-          opacity.value = this._waveFade.opacity
-          if (this.city._waveGradientOpacity) this.city._waveGradientOpacity.value = this._waveFade.gradOpacity
-          if (this.city._waveMaskStrength) this.city._waveMaskStrength.value = this._waveFade.mask
-        },
-      })
-    }
+      // Fade out waves immediately when a new grid starts building
+      this.city.onBeforeTilesChanged = () => {
+        if (this.city._autoBuilding) return
+        const opacity = this.city._waveOpacity
+        if (!opacity || opacity.value === 0) return
 
-    // After tiles drop, re-render mask and fade waves back in
-    this._pendingMaskRender = null
-    this.city.onTilesChanged = (animDonePromise) => {
-      if (this.city._autoBuilding) return
-      const opacity = this.city._waveOpacity
-      if (!opacity) return
+        // Cancel any pending mask render from a previous build
+        if (this._pendingMaskRender) {
+          this._pendingMaskRender.cancelled = true
+          this._pendingMaskRender = null
+        }
 
-      // Kill previous pending mask render (e.g. during rapid sequential builds)
-      if (this._pendingMaskRender) {
-        this._pendingMaskRender.cancelled = true
-        this._pendingMaskRender = null
-      }
-
-      const token = { cancelled: false }
-      this._pendingMaskRender = token
-
-      const renderMask = () => {
-        if (token.cancelled) return
-
-        // Kill any running wave tweens, snap to 0, render mask, fade back up
+        // Kill any running wave tweens and sync target with current uniforms
         gsap.killTweensOf(this._waveFade)
-        opacity.value = 0
-        if (this.city._waveGradientOpacity) this.city._waveGradientOpacity.value = 0
-        if (this.city._waveMaskStrength) this.city._waveMaskStrength.value = 0
-        this._waveFade.opacity = 0
-        this._waveFade.gradOpacity = 0
-        this._waveFade.mask = 0
-
-        const tileMeshes = []
-        for (const grid of this.city.grids.values()) {
-          if (grid.hexMesh) tileMeshes.push(grid.hexMesh)
-        }
-        this.wavesMask.render(this.scene, tileMeshes, this.city.waterPlane, this.city.globalCells)
+        this._waveFade.opacity = opacity.value
+        this._waveFade.gradOpacity = this.city._waveGradientOpacity?.value ?? 0
+        this._waveFade.mask = this.city._waveMaskStrength?.value ?? 1
 
         gsap.to(this._waveFade, {
-          opacity: this.params.waves.opacity,
-          gradOpacity: this.params.waves.gradientOpacity,
-          mask: 1,
-          duration: 2, delay: 1,
+          opacity: 0, gradOpacity: 0, mask: 0,
+          duration: 0.5,
           onUpdate: () => {
             opacity.value = this._waveFade.opacity
             if (this.city._waveGradientOpacity) this.city._waveGradientOpacity.value = this._waveFade.gradOpacity
@@ -223,9 +205,57 @@ export class App {
         })
       }
 
-      // Wait for drop animation to finish, then render mask
-      const promise = animDonePromise || Promise.resolve()
-      promise.then(renderMask)
+      // After tiles drop, re-render mask and fade waves back in
+      this._pendingMaskRender = null
+      this.city.onTilesChanged = (animDonePromise) => {
+        if (this.city._autoBuilding) return
+        const opacity = this.city._waveOpacity
+        if (!opacity) return
+
+        // Kill previous pending mask render (e.g. during rapid sequential builds)
+        if (this._pendingMaskRender) {
+          this._pendingMaskRender.cancelled = true
+          this._pendingMaskRender = null
+        }
+
+        const token = { cancelled: false }
+        this._pendingMaskRender = token
+
+        const renderMask = () => {
+          if (token.cancelled) return
+
+          // Kill any running wave tweens, snap to 0, render mask, fade back up
+          gsap.killTweensOf(this._waveFade)
+          opacity.value = 0
+          if (this.city._waveGradientOpacity) this.city._waveGradientOpacity.value = 0
+          if (this.city._waveMaskStrength) this.city._waveMaskStrength.value = 0
+          this._waveFade.opacity = 0
+          this._waveFade.gradOpacity = 0
+          this._waveFade.mask = 0
+
+          const tileMeshes = []
+          for (const grid of this.city.grids.values()) {
+            if (grid.hexMesh) tileMeshes.push(grid.hexMesh)
+          }
+          this.wavesMask.render(this.scene, tileMeshes, this.city.waterPlane, this.city.globalCells, this.city.landMaskMaterial)
+
+          gsap.to(this._waveFade, {
+            opacity: this.params.waves.opacity,
+            gradOpacity: this.params.waves.gradientOpacity,
+            mask: 1,
+            duration: 2, delay: 1,
+            onUpdate: () => {
+              opacity.value = this._waveFade.opacity
+              if (this.city._waveGradientOpacity) this.city._waveGradientOpacity.value = this._waveFade.gradOpacity
+              if (this.city._waveMaskStrength) this.city._waveMaskStrength.value = this._waveFade.mask
+            },
+          })
+        }
+
+        // Wait for drop animation to finish, then render mask
+        const promise = animDonePromise || Promise.resolve()
+        promise.then(renderMask)
+      }
     }
 
     // Set up hover and click detection on hex tiles and placeholders
@@ -259,33 +289,36 @@ export class App {
       }
     )
 
-    // Initialize GUI after modules are ready
-    this.gui = new GUIManager(this)
-    this.gui.init()
-    this.gui.gui.domElement.classList.add('gui-hidden')
-    this.gui.applyParams()
+    if (!RUNTIME_MINIMAL) {
+      // Initialize GUI after modules are ready
+      this.gui = new GUIManager(this)
+      this.gui.init()
+      this.gui.gui.domElement.classList.add('gui-hidden')
+      this.gui.applyParams()
 
-    // Move FPS meter into GUI panel, above DPR
-    this.stats.dom.style.display = ''
-    this.stats.dom.style.position = 'relative'
-    this.stats.dom.style.top = ''
-    this.stats.dom.style.left = '106px'
-    const guiChildren = this.gui.gui.domElement.querySelector('.children')
-    const dprEl = guiChildren?.firstElementChild
-    if (dprEl) guiChildren.insertBefore(this.stats.dom, dprEl)
-    else this.gui.gui.domElement.prepend(this.stats.dom)
+      // Move FPS meter into GUI panel, above DPR
+      this.stats.dom.style.display = ''
+      this.stats.dom.style.position = 'relative'
+      this.stats.dom.style.top = ''
+      this.stats.dom.style.left = '106px'
+      const guiChildren = this.gui.gui.domElement.querySelector('.children')
+      const dprEl = guiChildren?.firstElementChild
+      if (dprEl) guiChildren.insertBefore(this.stats.dom, dprEl)
+      else this.gui.gui.domElement.prepend(this.stats.dom)
 
-    // Pre-render full pipeline to compile GPU shaders while screen is still black
-    // BatchedMeshes already have a dummy instance from initMeshes()
-    const tileMeshes = []
-    for (const grid of this.city.grids.values()) {
-      if (grid.hexMesh) tileMeshes.push(grid.hexMesh)
+      // Pre-render full pipeline to compile GPU shaders while screen is still black
+      // BatchedMeshes already have a dummy instance from initMeshes()
+      const tileMeshes = []
+      for (const grid of this.city.grids.values()) {
+        if (grid.hexMesh) tileMeshes.push(grid.hexMesh)
+      }
+      this.wavesMask.render(this.scene, tileMeshes, this.city.waterPlane, this.city.globalCells, this.city.landMaskMaterial)
+      this.postFX.setOverlayObjects(this.city.getOverlayObjects())
+
+      this.postFX.setWaterObjects(this.city.getWaterObjects())
+      this.postFX.render()
+      if (restored) this.fadeIn(0)
     }
-    this.wavesMask.render(this.scene, tileMeshes, this.city.waterPlane, this.city.globalCells)
-    this.postFX.setOverlayObjects(this.city.getOverlayObjects())
-
-    this.postFX.setWaterObjects(this.city.getWaterObjects())
-    this.postFX.render()
 
     this.timer.connect(document)
 
@@ -303,6 +336,13 @@ export class App {
       }
     }
     requestAnimationFrame(loop)
+  }
+
+  publishMap() {
+    window.__Ashdomes_MAP__ = {
+      seed: getSeed(),
+      tiles: this.city.getCanonicalTiles(),
+    };
   }
 
   initCamera() {
@@ -495,18 +535,15 @@ export class App {
 
     // Action buttons
     const actions = [
-      { label: 'Build All', action: () => {
-        this.city.autoBuild([
-          [0,0],[0,-1],[1,-1],[1,0],[0,1],[-1,0],[-1,-1],[-1,-2],[0,-2],[1,-2],[2,-1],[2,0],[2,1],[1,1],[0,2],[-1,1],[-2,1],[-2,0],[-2,-1]
-        ])
-      }},
-      { label: 'Clear All', action: () => {
-        this.city.reset()
-        this.city.setHelpersVisible(this.params.debug.hexGrid)
-        this.perspCamera.position.set(0, 100, 58.5)
-        this.controls.target.set(0, 1, 0)
-        this.controls.update()
-      }},
+      { label: 'Generate', action: () => this.mapLibrary.run(() => this.mapLibrary.generate()) },
+      { label: 'Clear All', action: () => this.mapLibrary.run(async () => {
+        await this.city.reset()
+        this.mapLibrary.current = null
+        this.mapLibrary.sourceId = null
+        this.mapLibrary.refresh()
+        this.mapLibrary.message('Map cleared. Generate or open a saved map.')
+        this.publishMap()
+      }) },
     ]
 
     for (const { label, action } of actions) {
@@ -569,9 +606,9 @@ export class App {
   }
 
   animate() {
-    this.stats.begin()
+    if (this.stats) this.stats.begin()
 
-    const { controls, timer, postFX } = this
+    const { controls, timer } = this
 
     timer.update()
     const dt = timer.getDelta()
@@ -581,47 +618,54 @@ export class App {
     if (controls.target.y < 0) controls.target.y = 0
     this.lighting.updateShadowCamera(this.controls.target, this.camera, this.orthoCamera, this.perspCamera)
 
-    // Auto-focus DOF on orbit target, scale focal length with zoom
-    const dist = this.camera.position.distanceTo(controls.target)
-    postFX.dofFocus.value = dist
-    const t = Math.min(Math.max((dist - 25) / (410 - 25), 0), 1) // 0=zoomed in, 1=zoomed out
-    postFX.dofFocalLength.value = 20 + t * 80 // 20 at close, 100 at far
+    if (!RUNTIME_MINIMAL && this.postFX) {
+      // Auto-focus DOF on orbit target, scale focal length with zoom
+      const dist = this.camera.position.distanceTo(controls.target)
+      this.postFX.dofFocus.value = dist
+      const t = Math.min(Math.max((dist - 25) / (410 - 25), 0), 1) // 0=zoomed in, 1=zoomed out
+      this.postFX.dofFocalLength.value = 20 + t * 80 // 20 at close, 100 at far
 
-    // Animate grain noise — quantize to noiseFPS for film-like grain (0 = static)
-    const noiseFPS = this.params.fx.grainFPS
-    if (noiseFPS > 0) {
-      postFX.grainTime.value = Math.floor(timer.getElapsed() * noiseFPS) / noiseFPS
+      // Animate grain noise — quantize to noiseFPS for film-like grain (0 = static)
+      const noiseFPS = this.params.fx.grainFPS
+      if (noiseFPS > 0) {
+        this.postFX.grainTime.value = Math.floor(timer.getElapsed() * noiseFPS) / noiseFPS
+      }
     }
 
     // Update debris physics
     this.city.update(dt)
 
-    // Update render layers
-    const maskObjects = []
-    for (const grid of this.city.grids.values()) {
-      if (grid.hexMesh) maskObjects.push(grid.hexMesh)
-      if (grid.decorations?.mesh) maskObjects.push(grid.decorations.mesh)
+    if (!RUNTIME_MINIMAL && this.postFX) {
+      // Update render layers
+      const maskObjects = []
+      for (const grid of this.city.grids.values()) {
+        if (grid.hexMesh) maskObjects.push(grid.hexMesh)
+        if (grid.decorations?.mesh) maskObjects.push(grid.decorations.mesh)
+      }
+      this.postFX.setWaterMaskObjects(maskObjects)
+      this.postFX.setOverlayObjects(this.city.getOverlayObjects())
+      this.postFX.setWaterObjects(this.city.getWaterObjects())
+
+      this.postFX.render()
+
+      // Debug: show coast mask RT in bottom-left corner
+      if (this.wavesMask?.showDebug) this.wavesMask.renderDebug()
+    } else {
+      this.renderer.render(this.scene, this.camera)
     }
-    postFX.setWaterMaskObjects(maskObjects)
-    postFX.setOverlayObjects(this.city.getOverlayObjects())
-    postFX.setWaterObjects(this.city.getWaterObjects())
-
-    postFX.render()
-
-    // Debug: show coast mask RT in bottom-left corner
-    if (this.wavesMask?.showDebug) this.wavesMask.renderDebug()
 
     // Always render CSS labels (individual label.visible controls what shows)
     if (this.cssRenderer) {
       this.cssRenderer.render(this.scene, this.camera)
     }
 
-    this.stats.end()
+    if (this.stats) this.stats.end()
   }
 
   exportPNG({ format = 'image/jpeg', quality = 0.85, filename } = {}) {
     // Render one frame to ensure canvas is up to date
-    this.postFX.render()
+    if (this.postFX) this.postFX.render()
+    else this.renderer.render(this.scene, this.camera)
 
     // Get canvas data
     const canvas = this.renderer.domElement
@@ -638,6 +682,8 @@ export class App {
   }
 
   fadeIn(duration = 1000) {
-    gsap.to(this.postFX.fadeOpacity, { value: 1, duration: duration / 1000 })
+    if (this.postFX) {
+      gsap.to(this.postFX.fadeOpacity, { value: 1, duration: duration / 1000 })
+    }
   }
 }

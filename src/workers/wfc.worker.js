@@ -1,3 +1,4 @@
+import { stateWeight } from '../maps/GenerationSettings.js'
 /**
  * WFC Web Worker
  * Runs WFC solver in a separate thread to prevent UI freezing
@@ -23,10 +24,12 @@ import {
 // WFC Solver (cube-coordinate based)
 // ============================================================================
 
-class HexWFCSolver {
+export class HexWFCSolver {
   constructor(rules, options = {}) {
     this.rules = rules
     this.options = {
+      weights: options.weights,
+      elevation: options.elevation,
       maxTries: options.maxTries ?? 2,
       tileTypes: options.tileTypes ?? null,
       log: options.log ?? (() => {}),
@@ -49,7 +52,7 @@ class HexWFCSolver {
     // Backtracking state (trail-based — records only changes, not full copies)
     this.trail = []       // { key, stateKey } — each possibility removed during propagation
     this.decisions = []   // stack of { targetKey, prevPossibilities, trailStart, collapseOrderLen, triedStates }
-    this.maxBacktracks = 500
+    this.maxBacktracks = options.maxBacktracks ?? 500
     this.backtracks = 0
     // Neighbor cell data: cells that CAN be unfixed on neighbor conflict
     this.neighborData = new Map()     // cubeKey → { q,r,s, anchors: [...], original: {type,rotation,level} }
@@ -178,7 +181,7 @@ class HexWFCSolver {
     const possArray = Array.from(cell.possibilities)
     const weights = possArray.map(k => {
       const state = HexWFCCell.parseKey(k)
-      return TILE_LIST[state.type]?.weight ?? 1
+      return stateWeight(state, this.options)
     })
     const totalWeight = weights.reduce((a, b) => a + b, 0)
     let r = random() * totalWeight
@@ -218,11 +221,10 @@ class HexWFCSolver {
       for (const stateKey of [...neighbor.possibilities]) {
         if (stateKey.startsWith(prefix)) {
           neighbor.possibilities.delete(stateKey)
+          this.trail.push({ key: nKey, stateKey })
         }
       }
-      if (neighbor.possibilities.size > 0) {
-        this.propagationStack.push(nKey)
-      }
+      this.propagationStack.push(nKey)
     }
   }
 
@@ -267,7 +269,7 @@ class HexWFCSolver {
 
     const weights = available.map(k => {
       const state = HexWFCCell.parseKey(k)
-      return TILE_LIST[state.type]?.weight ?? 1
+      return stateWeight(state, this.options)
     })
     const total = weights.reduce((a, b) => a + b, 0)
     let r = random() * total
@@ -294,25 +296,23 @@ class HexWFCSolver {
   }
 
   backtrack() {
-    this.backtracks++
-    if (this.backtracks >= this.maxBacktracks) {
-      if (!this.options.quiet) this.log(`${this.options.gridId ? `[${this.options.gridId}] ` : ''}WFC FAIL [backtrack limit reached]`, 'red')
-      return false
+    // Retry the existing decision, retaining its failed choices. Returning an
+    // uncollapsed cell to the main loop would create a fresh decision and forget
+    // those choices, repeatedly exploring the same contradiction.
+    while (this.decisions.length) {
+      this.backtracks++
+      if (this.backtracks >= this.maxBacktracks) {
+        if (!this.options.quiet) this.log(`${this.options.gridId ? `[${this.options.gridId}] ` : ''}WFC FAIL [backtrack limit reached]`, 'red')
+        return false
+      }
+      const decision = this.undoLastDecision()
+      if (!this.collapseWithExclusions(decision.targetKey, decision.triedStates)) {
+        this.decisions.pop()
+        continue
+      }
+      if (this.propagate()) return true
     }
-
-    const decision = this.undoLastDecision()
-    if (!decision) return false
-
-    const cell = this.cells.get(decision.targetKey)
-    const available = [...cell.possibilities].filter(k => !decision.triedStates.has(k))
-
-    if (available.length === 0) {
-      // All states exhausted for this cell — pop and backtrack further
-      this.decisions.pop()
-      return this.backtrack()
-    }
-
-    return true
+    return false
   }
 
   /**
@@ -344,6 +344,8 @@ class HexWFCSolver {
       } else {
         possibilities = cell.possibilities
       }
+
+      if (possibilities.size === 0) return false
 
       const nbrs = this.neighbors.get(key)
       if (!nbrs) continue

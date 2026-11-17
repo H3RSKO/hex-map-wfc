@@ -1,5 +1,6 @@
 import { GLTFLoader } from 'three/examples/jsm/Addons.js'
 import { Color } from 'three/webgpu'
+import { detailTerrain } from './NaturalGeometry.js'
 import {
   TILE_LIST,
   TileType,
@@ -159,7 +160,7 @@ export class HexTileGeometry {
       // Load geometries for all active tile types
       for (let type = 0; type < TILE_LIST.length; type++) {
         const tile = TILE_LIST[type]
-        const result = this.findAndProcessGeometry(gltf.scene, tile.mesh)
+        const result = this.findAndProcessGeometry(gltf.scene, tile.mesh, tile.levelIncrement)
         if (result.geom) {
           this.geoms.set(type, result.geom)
         }
@@ -198,7 +199,7 @@ export class HexTileGeometry {
    * Find geometry by mesh name and scale it
    * Assumes Blender origin is centered XZ with Y at surface (y=1)
    */
-  static findAndProcessGeometry(scene, meshName) {
+  static findAndProcessGeometry(scene, meshName, levelIncrement = 1) {
     let mesh = null
     scene.traverse((child) => {
       if (child.name === meshName && child.geometry) {
@@ -212,9 +213,13 @@ export class HexTileGeometry {
     }
 
     // Clone and scale geometry — origin from Blender is trusted (centered XZ, Y at surface)
-    const geom = mesh.geometry.clone()
+    let geom = mesh.geometry.clone()
     geom.scale(this.SCALE, this.SCALE, this.SCALE)
     geom.translate(0, 1 * this.SCALE, 0)
+
+    const authored = geom
+    geom = detailTerrain(authored, meshName, { riverRise: levelIncrement * 0.5 })
+    authored.dispose()
 
     geom.computeBoundingBox()
     geom.computeBoundingSphere()
