@@ -14,7 +14,7 @@ async function walk(path) {
   for (const entry of (await readdir(path, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
     const name = `${path}/${entry.name}`
     if (entry.isDirectory()) await walk(name)
-    else if (!name.endsWith('AssetRelease.json')) await add(name, name.startsWith('src/') ? 'implementation' : name.includes('/textures/') ? 'textures' : 'source')
+    else if (entry.name !== '.DS_Store' && !name.endsWith('AssetRelease.json')) await add(name, name.startsWith('src/') ? 'implementation' : name.includes('/textures/') ? 'textures' : 'source')
   }
 }
 await walk('src')
